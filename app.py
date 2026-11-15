@@ -1183,7 +1183,7 @@ footer {
         <div class="upload">
 
             <h3>
-                Upload a leaf photograph
+                Upload a crop photograph
             </h3>
 
             <p>
