@@ -7,14 +7,18 @@ Phase 4: Flask web application
 Expected checkpoint:
     models/efficientnet_b0_best.pth
 
-Run:
+Run locally:
     python app.py
+
+Render start command:
+    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 180
 """
 
 import os
 import json
 import uuid
 import logging
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +28,9 @@ import torch.nn.functional as F
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 from flask import (
-    Flask, request, render_template_string,
+    Flask,
+    request,
+    render_template_string,
     url_for
 )
 from werkzeug.utils import secure_filename
@@ -59,6 +65,12 @@ MAX_FILE_SIZE = 12 * 1024 * 1024
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+# Reduce CPU thread contention on small Render instances.
+torch.set_num_threads(1)
+
+# Prevent simultaneous predictions from competing for memory.
+INFERENCE_LOCK = threading.Lock()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AgroDetect")
@@ -240,6 +252,7 @@ def build_model():
 
 
 def load_model():
+
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(
             f"EfficientNet checkpoint not found: {MODEL_PATH}\n"
@@ -254,6 +267,7 @@ def load_model():
             map_location="cpu",
             weights_only=True
         )
+
     except TypeError:
         checkpoint = torch.load(
             MODEL_PATH,
@@ -270,6 +284,11 @@ def load_model():
     model.to(DEVICE)
     model.eval()
 
+    # Grad-CAM needs gradients on its target activation,
+    # not on the model's parameters.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
     logger.info("EfficientNet-B0 loaded successfully.")
     logger.info("Device: %s", DEVICE)
 
@@ -281,6 +300,7 @@ MODEL_ERROR = None
 
 try:
     MODEL = load_model()
+
 except Exception as exc:
     MODEL_ERROR = str(exc)
     logger.exception("Model initialization failed.")
@@ -291,12 +311,17 @@ except Exception as exc:
 # ============================================================
 
 class GradCAM:
-    """Grad-CAM for EfficientNet-B0 using its final convolutional layer."""
+    """
+    Memory-conscious Grad-CAM for EfficientNet-B0.
+
+    Uses the final convolutional layer of EfficientNet-B0.
+    """
 
     def __init__(self, model):
+
         self.model = model
         self.activations = None
-        self.gradients = None
+
         target_layer = None
 
         for module in model.features.modules():
@@ -304,42 +329,80 @@ class GradCAM:
                 target_layer = module
 
         if target_layer is None:
-            raise RuntimeError("Could not locate EfficientNet convolutional layer.")
+            raise RuntimeError(
+                "Could not locate EfficientNet convolutional layer."
+            )
 
-        self.handle = target_layer.register_forward_hook(self.forward_hook)
+        self.handle = target_layer.register_forward_hook(
+            self.forward_hook
+        )
 
     def forward_hook(self, module, inputs, output):
+
+        # Enable gradients for the selected feature map.
+        output.requires_grad_(True)
+
         self.activations = output
-        if output.requires_grad:
-            output.register_hook(self.save_gradient)
 
-    def save_gradient(self, gradient):
-        self.gradients = gradient
+    def generate(self, input_tensor):
 
-    def generate(self, input_tensor, target_class=None):
-        self.model.zero_grad(set_to_none=True)
-        self.gradients = None
         self.activations = None
 
         with torch.enable_grad():
-            input_tensor = input_tensor.clone().detach().requires_grad_(True)
-            output = self.model(input_tensor)
-            if target_class is None:
-                target_class = int(output.argmax(dim=1).item())
-            output[:, target_class].sum().backward()
 
-            if self.gradients is None or self.activations is None:
-                raise RuntimeError("Grad-CAM failed to capture activations or gradients.")
+            logits = self.model(input_tensor)
 
-            weights = self.gradients.mean(dim=(2, 3), keepdim=True)
-            cam = torch.relu((weights * self.activations).sum(dim=1, keepdim=True))
-            cam = F.interpolate(cam, size=(224, 224), mode="bilinear", align_corners=False)
+            if self.activations is None:
+                raise RuntimeError(
+                    "Grad-CAM did not capture target activations."
+                )
+
+            predicted_class = int(
+                logits.argmax(dim=1).item()
+            )
+
+            gradients = torch.autograd.grad(
+                outputs=logits[:, predicted_class].sum(),
+                inputs=self.activations,
+                retain_graph=False,
+                create_graph=False
+            )[0]
+
+            weights = gradients.mean(
+                dim=(2, 3),
+                keepdim=True
+            )
+
+            cam = torch.relu(
+                (weights * self.activations).sum(
+                    dim=1,
+                    keepdim=True
+                )
+            )
+
+            cam = F.interpolate(
+                cam,
+                size=(IMAGE_SIZE, IMAGE_SIZE),
+                mode="bilinear",
+                align_corners=False
+            )
+
             cam = cam[0, 0].detach().cpu().numpy()
-            cam_min, cam_max = cam.min(), cam.max()
-            return (cam - cam_min) / (cam_max - cam_min + 1e-8)
+
+            cam_min = cam.min()
+            cam_max = cam.max()
+
+            cam = (
+                (cam - cam_min) /
+                (cam_max - cam_min + 1e-8)
+            )
+
+            return cam, logits.detach()
 
     def close(self):
+
         self.handle.remove()
+        self.activations = None
 
 
 # ============================================================
@@ -364,7 +427,13 @@ def create_heatmap(original, cam, output_path):
 
     # Blue -> cyan/green -> yellow/red style heatmap.
     red = np.clip(1.5 * heat, 0, 1)
-    green = np.clip(1.5 - np.abs(2 * heat - 1) * 1.5, 0, 1)
+
+    green = np.clip(
+        1.5 - np.abs(2 * heat - 1) * 1.5,
+        0,
+        1
+    )
+
     blue = np.clip(1.0 - 1.5 * heat, 0, 1)
 
     colored = np.stack(
@@ -403,6 +472,7 @@ def get_guidance(class_name):
     lower = label.lower()
 
     if "healthy" in lower:
+
         return {
             "status": "Healthy",
             "description": "The model classified the leaf as healthy.",
@@ -419,6 +489,7 @@ def get_guidance(class_name):
         }
 
     if "powdery mildew" in lower:
+
         remedy = [
             "Remove severely affected leaves where practical.",
             "Improve airflow around plants.",
@@ -427,6 +498,7 @@ def get_guidance(class_name):
         ]
 
     elif "rust" in lower:
+
         remedy = [
             "Remove heavily infected plant debris.",
             "Improve air circulation.",
@@ -435,6 +507,7 @@ def get_guidance(class_name):
         ]
 
     elif "bacterial" in lower:
+
         remedy = [
             "Remove severely infected plant material.",
             "Avoid handling plants when foliage is wet.",
@@ -443,6 +516,7 @@ def get_guidance(class_name):
         ]
 
     elif "late blight" in lower:
+
         remedy = [
             "Remove infected plant material promptly.",
             "Avoid overhead irrigation.",
@@ -451,6 +525,7 @@ def get_guidance(class_name):
         ]
 
     elif "early blight" in lower:
+
         remedy = [
             "Remove affected lower leaves.",
             "Clear infected crop debris.",
@@ -459,6 +534,7 @@ def get_guidance(class_name):
         ]
 
     elif "scab" in lower:
+
         remedy = [
             "Remove fallen infected leaves and fruit.",
             "Prune for better airflow.",
@@ -467,6 +543,7 @@ def get_guidance(class_name):
         ]
 
     elif "mosaic" in lower or "yellow leaf curl" in lower:
+
         remedy = [
             "Isolate affected plants where practical.",
             "Remove severely infected plants according to local guidance.",
@@ -475,6 +552,7 @@ def get_guidance(class_name):
         ]
 
     elif "spider mite" in lower:
+
         remedy = [
             "Inspect the underside of leaves.",
             "Remove heavily infested leaves.",
@@ -483,6 +561,7 @@ def get_guidance(class_name):
         ]
 
     elif "citrus greening" in lower or "huanglongbing" in lower:
+
         remedy = [
             "Contact a local agricultural extension specialist.",
             "Inspect for Asian citrus psyllid.",
@@ -490,6 +569,7 @@ def get_guidance(class_name):
         ]
 
     elif "mold" in lower:
+
         remedy = [
             "Remove affected leaves.",
             "Improve ventilation.",
@@ -498,6 +578,7 @@ def get_guidance(class_name):
         ]
 
     else:
+
         remedy = [
             "Remove severely affected plant material.",
             "Improve airflow and growing conditions.",
@@ -520,47 +601,60 @@ def get_guidance(class_name):
 
 
 # ============================================================
-# 8. PREDICTION PIPELINE
+# 8. OPTIMIZED PREDICTION PIPELINE
 # ============================================================
 
 def predict_image(image_path):
+
     if MODEL is None:
         raise RuntimeError(
             "EfficientNet-B0 is not loaded: " + str(MODEL_ERROR)
         )
 
-    original = Image.open(image_path)
-    original = ImageOps.exif_transpose(original).convert("RGB")
+    # Open and normalize uploaded image.
+    with Image.open(image_path) as image:
+
+        original = ImageOps.exif_transpose(image).convert("RGB")
+
+        # Limit unusually large images to reduce memory consumption.
+        original.thumbnail(
+            (1600, 1600),
+            Image.Resampling.LANCZOS
+        )
 
     input_tensor = transform(original).unsqueeze(0).to(DEVICE)
 
-    gradcam = GradCAM(MODEL)
+    # One forward pass supplies both prediction and Grad-CAM.
+    # The lock prevents simultaneous inference requests.
+    with INFERENCE_LOCK:
 
-    try:
-        # Forward pass and probabilities.
-        with torch.no_grad():
-            logits = MODEL(input_tensor)
-            probabilities = torch.softmax(logits, dim=1)[0]
+        gradcam = GradCAM(MODEL)
 
-        predicted_index = int(torch.argmax(probabilities).item())
+        try:
 
-        confidence = float(
-            probabilities[predicted_index].item() * 100
-        )
+            cam, logits = gradcam.generate(input_tensor)
 
-        # Grad-CAM requires gradients, so run a separate forward pass.
-        cam = gradcam.generate(
-            input_tensor,
-            predicted_index
-        )
+        finally:
 
-    finally:
-        gradcam.close()
+            gradcam.close()
+
+    # Calculate prediction probabilities.
+    probabilities = torch.softmax(logits, dim=1)[0]
+
+    predicted_index = int(
+        torch.argmax(probabilities).item()
+    )
+
+    confidence = float(
+        probabilities[predicted_index].item() * 100
+    )
 
     prediction = CLASS_NAMES[predicted_index]
 
+    # Calculate top three predictions.
     top_values, top_indices = torch.topk(
-        probabilities, k=3
+        probabilities,
+        k=3
     )
 
     top_predictions = []
@@ -569,22 +663,37 @@ def predict_image(image_path):
         top_values.tolist(),
         top_indices.tolist()
     ):
+
         top_predictions.append({
             "name": CLASS_NAMES[index],
             "confidence": round(value * 100, 2)
         })
 
+    # Generate Grad-CAM image.
     heatmap_filename = f"{uuid.uuid4().hex}.jpg"
+
     heatmap_path = HEATMAP_DIR / heatmap_filename
 
-    create_heatmap(original, cam, heatmap_path)
+    create_heatmap(
+        original,
+        cam,
+        heatmap_path
+    )
 
     return {
         "prediction": prediction,
-        "display_name": prediction.replace("___", " - ").replace("_", " "),
+
+        "display_name": prediction.replace(
+            "___",
+            " - "
+        ).replace("_", " "),
+
         "confidence": round(confidence, 2),
+
         "top_predictions": top_predictions,
+
         "guidance": get_guidance(prediction),
+
         "heatmap": heatmap_filename
     }
 
@@ -598,11 +707,16 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 
 ALLOWED_EXTENSIONS = {
-    "jpg", "jpeg", "png", "webp", "bmp"
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
+    "bmp"
 }
 
 
 def allowed_file(filename):
+
     return (
         "." in filename
         and filename.rsplit(".", 1)[1].lower()
@@ -617,21 +731,25 @@ def allowed_file(filename):
 HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
+
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <title>AgroDetect | Plant Disease Intelligence</title>
 
 <style>
+
 :root {
-    --bg: #f4f7f2;
+    --bg: #f2f7f2;
     --surface: #ffffff;
-    --green: #237b45;
-    --dark: #153c28;
-    --text: #20352a;
-    --muted: #708174;
-    --border: #e2e9e1;
+    --green: #187344;
+    --dark: #103b29;
+    --text: #183528;
+    --muted: #64796d;
+    --border: #dce9df;
 }
 
 * {
@@ -640,23 +758,45 @@ HTML = r"""
 
 body {
     margin: 0;
-    background: var(--bg);
+    background: radial-gradient(
+        circle at 12% 0%,
+        #e2f2e5 0,
+        transparent 34%
+    ), var(--bg);
+
     color: var(--text);
+
     font-family: Inter, Segoe UI, Arial, sans-serif;
 }
 
 header {
-    background: var(--dark);
+    background: linear-gradient(
+        115deg,
+        #0d3324,
+        #17613d 72%,
+        #237a4b
+    );
+
     color: white;
-    padding: 18px 7%;
+
+    padding: 20px max(
+        5%,
+        calc((100% - 1180px) / 2)
+    );
+
     display: flex;
+
     align-items: center;
+
     justify-content: space-between;
+
+    box-shadow: 0 8px 28px rgba(11, 48, 31, .16);
 }
 
 .brand {
     font-size: 23px;
     font-weight: 800;
+    letter-spacing: -.5px;
 }
 
 .brand span {
@@ -668,63 +808,142 @@ header small {
 }
 
 .container {
-    width: min(1120px, 92%);
-    margin: 42px auto;
+    width: min(1160px, 92%);
+    margin: 48px auto;
 }
 
 .hero {
     margin-bottom: 30px;
+
+    padding: 30px 34px;
+
+    border-radius: 22px;
+
+    background: linear-gradient(
+        120deg,
+        rgba(255,255,255,.94),
+        rgba(235,247,237,.92)
+    );
+
+    border: 1px solid #dcebe0;
+
+    box-shadow: 0 14px 38px rgba(24,75,45,.06);
 }
 
 .hero h1 {
     font-size: clamp(30px, 5vw, 46px);
+
     margin-bottom: 10px;
+
     color: var(--dark);
+
+    letter-spacing: -1.3px;
+
+    line-height: 1.12;
 }
 
 .hero p {
     color: var(--muted);
+
     line-height: 1.7;
+
+    max-width: 760px;
+
+    font-size: 16px;
 }
 
 .panel {
     background: var(--surface);
+
     border: 1px solid var(--border);
-    border-radius: 18px;
-    padding: 28px;
+
+    border-radius: 20px;
+
+    padding: 30px;
+
     margin-bottom: 24px;
-    box-shadow: 0 8px 30px rgba(20, 50, 30, .04);
+
+    box-shadow: 0 12px 34px rgba(20, 60, 35, .055);
+
+    transition: transform .18s ease, box-shadow .18s ease;
+}
+
+.panel:hover {
+    box-shadow: 0 16px 40px rgba(20, 60, 35, .085);
 }
 
 .upload {
-    border: 2px dashed #a8cbb0;
-    border-radius: 14px;
-    padding: 38px 20px;
+    border: 2px dashed #8fbea0;
+
+    border-radius: 18px;
+
+    padding: 46px 22px;
+
     text-align: center;
-    background: #f8fbf7;
+
+    background: linear-gradient(
+        145deg,
+        #f7fcf7,
+        #eef8f0
+    );
 }
 
 .upload h3 {
+    color: var(--dark);
+    font-size: 21px;
     margin-bottom: 8px;
 }
 
 input[type=file] {
+    display: block;
+
     max-width: 100%;
-    margin: 18px auto;
+
+    margin: 20px auto;
+
+    padding: 12px;
+
+    border: 1px solid #d6e6d9;
+
+    border-radius: 10px;
+
+    background: white;
 }
 
 button {
-    background: var(--green);
+    background: linear-gradient(
+        110deg,
+        #187344,
+        #239354
+    );
+
     color: white;
+
     border: none;
-    padding: 14px 26px;
-    border-radius: 10px;
+
+    padding: 14px 28px;
+
+    border-radius: 11px;
+
     font-weight: 700;
+
     cursor: pointer;
+
+    box-shadow: 0 6px 16px rgba(24,115,68,.18);
+
+    transition: transform .15s ease, box-shadow .15s ease;
 }
 
 button:hover {
-    background: #185f34;
+    background: linear-gradient(
+        110deg,
+        #125d36,
+        #187344
+    );
+
+    transform: translateY(-1px);
+
+    box-shadow: 0 9px 20px rgba(24,115,68,.24);
 }
 
 button:disabled {
@@ -734,121 +953,144 @@ button:disabled {
 
 .error {
     color: #a32727;
+
     background: #fff0f0;
+
     padding: 14px;
+
     border-radius: 10px;
+
     margin-bottom: 20px;
+
+    overflow-wrap: anywhere;
 }
 
 .notice {
     color: #76551c;
+
     background: #fff7e5;
+
     border: 1px solid #f0dfb8;
+
     padding: 14px;
+
     border-radius: 10px;
+
     margin-bottom: 20px;
+
     overflow-wrap: anywhere;
 }
 
 .result-title {
     color: var(--dark);
+
     font-size: 25px;
+
     margin-top: 0;
+
+    letter-spacing: -.45px;
 }
 
 .confidence {
+    display: inline-block;
+
     font-size: 36px;
+
     color: var(--green);
+
     font-weight: 800;
+
     margin: 8px 0;
+
+    padding: 5px 15px;
+
+    border-radius: 12px;
+
+    background: #eaf7ee;
 }
 
 .images {
     display: grid;
+
     grid-template-columns: repeat(2, 1fr);
+
     gap: 20px;
 }
 
 .images img {
     width: 100%;
+
+    max-height: 440px;
+
+    object-fit: contain;
+
+    background: #f7faf7;
+
+    padding: 7px;
+
     border-radius: 12px;
+
     border: 1px solid var(--border);
 }
 
 .image-label {
     font-weight: 700;
+
+    color: var(--dark);
+
     margin-bottom: 10px;
 }
 
 .result-grid {
     display: grid;
+
     grid-template-columns: 1fr 1fr;
+
     gap: 24px;
 }
 
 ul {
     padding-left: 21px;
+
     line-height: 1.9;
 }
 
 .top-item {
+    display: flex;
+
+    justify-content: space-between;
+
+    gap: 18px;
+
     padding: 12px 0;
+
     border-bottom: 1px solid var(--border);
+}
+
+.panel h2 {
+    letter-spacing: -.45px;
 }
 
 footer {
     padding: 30px;
+
     text-align: center;
+
     color: var(--muted);
-}
 
+    border-top: 1px solid var(--border);
 
-/* AgroDetect visual refinement */
-:root {
-    --bg: #f2f7f2;
-    --surface: #ffffff;
-    --green: #187344;
-    --dark: #103b29;
-    --text: #183528;
-    --muted: #64796d;
-    --border: #dce9df;
-}
-body {
-    background: radial-gradient(circle at 12% 0%, #e2f2e5 0, transparent 34%), var(--bg);
-}
-header {
-    background: linear-gradient(115deg, #0d3324, #17613d 72%, #237a4b);
-    padding: 20px max(5%, calc((100% - 1180px) / 2));
-    box-shadow: 0 8px 28px rgba(11, 48, 31, .16);
-}
-.brand { letter-spacing: -.5px; }
-.container { width: min(1160px, 92%); margin: 48px auto; }
-.hero { padding: 30px 34px; border-radius: 22px; background: linear-gradient(120deg, rgba(255,255,255,.94), rgba(235,247,237,.92)); border: 1px solid #dcebe0; box-shadow: 0 14px 38px rgba(24,75,45,.06); }
-.hero h1 { letter-spacing: -1.3px; line-height: 1.12; }
-.hero p { max-width: 760px; font-size: 16px; }
-.panel { border-radius: 20px; padding: 30px; box-shadow: 0 12px 34px rgba(20, 60, 35, .055); transition: transform .18s ease, box-shadow .18s ease; }
-.panel:hover { box-shadow: 0 16px 40px rgba(20, 60, 35, .085); }
-.upload { border: 2px dashed #8fbea0; border-radius: 18px; padding: 46px 22px; background: linear-gradient(145deg, #f7fcf7, #eef8f0); }
-.upload h3 { color: var(--dark); font-size: 21px; }
-input[type=file] { display: block; max-width: 100%; margin: 20px auto; padding: 12px; border: 1px solid #d6e6d9; border-radius: 10px; background: white; }
-button { background: linear-gradient(110deg, #187344, #239354); padding: 14px 28px; border-radius: 11px; box-shadow: 0 6px 16px rgba(24,115,68,.18); transition: transform .15s ease, box-shadow .15s ease; }
-button:hover { background: linear-gradient(110deg, #125d36, #187344); transform: translateY(-1px); box-shadow: 0 9px 20px rgba(24,115,68,.24); }
-.result-title, .panel h2 { letter-spacing: -.45px; }
-.confidence { display: inline-block; padding: 5px 15px; border-radius: 12px; background: #eaf7ee; }
-.images img { max-height: 440px; object-fit: contain; background: #f7faf7; padding: 7px; }
-.image-label { color: var(--dark); }
-.top-item { display: flex; justify-content: space-between; gap: 18px; }
-footer { border-top: 1px solid var(--border); background: rgba(255,255,255,.55); }
-@media(max-width:700px) {
-    .container { margin: 24px auto; }
-    .hero { padding: 24px 20px; }
-    .panel { padding: 20px; }
-    header { gap: 12px; flex-wrap: wrap; }
+    background: rgba(255,255,255,.55);
 }
 
 @media(max-width:700px) {
-    .images, .result-grid {
-        grid-template-columns: 1fr;
+
+    .container {
+        margin: 24px auto;
+    }
+
+    .hero {
+        padding: 24px 20px;
     }
 
     .panel {
@@ -856,47 +1098,97 @@ footer { border-top: 1px solid var(--border); background: rgba(255,255,255,.55);
     }
 
     header {
+        gap: 12px;
+
+        flex-wrap: wrap;
+
         padding: 16px 5%;
     }
+
+    .images,
+    .result-grid {
+        grid-template-columns: 1fr;
+    }
 }
+
 </style>
+
 </head>
 
 <body>
 
 <header>
-    <div class="brand">Agro<span>Detect</span></div>
-    <small>Powered by EfficientNet-B0</small>
+
+    <div class="brand">
+        Agro<span>Detect</span>
+    </div>
+
+    <small>
+        Powered by EfficientNet-B0
+    </small>
+
 </header>
+
 
 <main class="container">
 
+
 <section class="hero">
-    <h1>Plant Disease Intelligence</h1>
+
+    <h1>
+        Plant Disease Intelligence
+    </h1>
+
     <p>
         Upload a plant leaf image to identify its condition,
         visualize the model's attention using Grad-CAM,
         and explore recommended management practices.
     </p>
+
 </section>
 
+
 {% if error %}
+
 <div class="notice">
-    <strong>Model unavailable</strong><br>
+
+    <strong>Model unavailable</strong>
+
+    <br>
+
     {{ error }}
+
 </div>
+
 {% endif %}
+
 
 {% if message %}
-<div class="error">{{ message }}</div>
+
+<div class="error">
+    {{ message }}
+</div>
+
 {% endif %}
 
+
 <section class="panel">
-    <form action="/predict" method="POST" enctype="multipart/form-data">
+
+    <form
+        action="/predict"
+        method="POST"
+        enctype="multipart/form-data"
+    >
 
         <div class="upload">
-            <h3>Upload a leaf photograph</h3>
-            <p>Supported: JPG, JPEG, PNG, WEBP, BMP</p>
+
+            <h3>
+                Upload a leaf photograph
+            </h3>
+
+            <p>
+                Supported: JPG, JPEG, PNG, WEBP, BMP
+            </p>
 
             <input
                 type="file"
@@ -912,43 +1204,75 @@ footer { border-top: 1px solid var(--border); background: rgba(255,255,255,.55);
                 type="submit"
                 {% if not ready %}disabled{% endif %}
             >
+
                 Analyze Plant Image
+
             </button>
+
         </div>
 
     </form>
+
 </section>
+
 
 {% if result %}
 
+
 <section class="panel">
 
-    <h2 class="result-title">Prediction Results</h2>
+    <h2 class="result-title">
+        Prediction Results
+    </h2>
 
-    <h3>{{ result.display_name }}</h3>
+    <h3>
+        {{ result.display_name }}
+    </h3>
 
     <div class="confidence">
         {{ result.confidence }}%
     </div>
 
-    <p>Model confidence score</p>
+    <p>
+        Model confidence score
+    </p>
 
 </section>
 
+
 <section class="panel">
 
-    <h2>Grad-CAM Visualization</h2>
+    <h2>
+        Grad-CAM Visualization
+    </h2>
 
     <div class="images">
 
         <div>
-            <div class="image-label">Original Image</div>
-            <img src="{{ original_url }}" alt="Uploaded plant leaf">
+
+            <div class="image-label">
+                Original Image
+            </div>
+
+            <img
+                src="{{ original_url }}"
+                alt="Uploaded plant leaf"
+            >
+
         </div>
 
+
         <div>
-            <div class="image-label">Grad-CAM Heatmap Overlay</div>
-            <img src="{{ heatmap_url }}" alt="Grad-CAM visualization">
+
+            <div class="image-label">
+                Grad-CAM Heatmap Overlay
+            </div>
+
+            <img
+                src="{{ heatmap_url }}"
+                alt="Grad-CAM visualization"
+            >
+
         </div>
 
     </div>
@@ -961,58 +1285,108 @@ footer { border-top: 1px solid var(--border); background: rgba(255,255,255,.55);
 
 </section>
 
+
 <section class="panel">
 
-    <h2>Top Predictions</h2>
+    <h2>
+        Top Predictions
+    </h2>
 
     {% for item in result.top_predictions %}
+
         <div class="top-item">
-            <strong>{{ item.name.replace("___", " - ").replace("_", " ") }}</strong>
-            <span style="float:right">{{ item.confidence }}%</span>
+
+            <strong>
+                {{ item.name.replace("___", " - ").replace("_", " ") }}
+            </strong>
+
+            <span>
+                {{ item.confidence }}%
+            </span>
+
         </div>
+
     {% endfor %}
 
 </section>
 
+
 <section class="panel">
 
-    <h2>Disease Information</h2>
+    <h2>
+        Disease Information
+    </h2>
 
-    <p>{{ result.guidance.description }}</p>
+    <p>
+        {{ result.guidance.description }}
+    </p>
 
     <div class="result-grid">
 
-        <div>
-            <h3>Management Recommendations</h3>
-            <ul>
-                {% for item in result.guidance.remedy %}
-                    <li>{{ item }}</li>
-                {% endfor %}
-            </ul>
-        </div>
 
         <div>
-            <h3>Prevention</h3>
+
+            <h3>
+                Management Recommendations
+            </h3>
+
             <ul>
-                {% for item in result.guidance.prevention %}
-                    <li>{{ item }}</li>
+
+                {% for item in result.guidance.remedy %}
+
+                    <li>
+                        {{ item }}
+                    </li>
+
                 {% endfor %}
+
             </ul>
+
         </div>
+
+
+        <div>
+
+            <h3>
+                Prevention
+            </h3>
+
+            <ul>
+
+                {% for item in result.guidance.prevention %}
+
+                    <li>
+                        {{ item }}
+                    </li>
+
+                {% endfor %}
+
+            </ul>
+
+        </div>
+
 
     </div>
 
 </section>
 
+
 {% endif %}
+
 
 </main>
 
+
 <footer>
+
     AgroDetect | Plant Disease Classification and Explainable AI
+
     <br>
+
     EfficientNet-B0 + Grad-CAM
+
 </footer>
+
 
 </body>
 </html>
@@ -1039,6 +1413,7 @@ def home():
 def predict():
 
     if MODEL is None:
+
         return render_template_string(
             HTML,
             ready=False,
@@ -1048,6 +1423,7 @@ def predict():
         )
 
     if "image" not in request.files:
+
         return render_template_string(
             HTML,
             ready=True,
@@ -1059,6 +1435,7 @@ def predict():
     file = request.files["image"]
 
     if not file or not file.filename:
+
         return render_template_string(
             HTML,
             ready=True,
@@ -1068,6 +1445,7 @@ def predict():
         )
 
     if not allowed_file(file.filename):
+
         return render_template_string(
             HTML,
             ready=True,
@@ -1083,6 +1461,7 @@ def predict():
     image_path = UPLOAD_DIR / unique_name
 
     try:
+
         file.save(image_path)
 
         # Validate actual image contents.
@@ -1108,6 +1487,7 @@ def predict():
         )
 
     except (UnidentifiedImageError, OSError):
+
         return render_template_string(
             HTML,
             ready=True,
@@ -1117,6 +1497,7 @@ def predict():
         )
 
     except Exception as exc:
+
         logger.exception("Prediction failed")
 
         return render_template_string(
@@ -1150,16 +1531,20 @@ if __name__ == "__main__":
     print("\n====================================")
     print("       AGRODETECT APPLICATION")
     print("====================================")
+
     print("Model: EfficientNet-B0")
     print("Device:", DEVICE)
     print("Classes:", len(CLASS_NAMES))
     print("Model loaded:", MODEL is not None)
 
     if MODEL is None:
+
         print("MODEL ERROR:", MODEL_ERROR)
+
         print("Place the checkpoint at:", MODEL_PATH)
 
     print("URL: http://127.0.0.1:5000")
+
     print("====================================\n")
 
     app.run(
